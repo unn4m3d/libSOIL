@@ -15,7 +15,7 @@ LIBNAME = libSOIL
 HFILES = SOIL.h image_DXT.h image_helper.h \
   stbi_DDS_aug.h stbi_DDS_aug_c.h stb_image_aug.h stb_image_write.h
 AFILE = libSOIL.a
-INCLUDEDIR = /usr/local/include
+INCLUDEDIR = /usr/local/include/SOIL
 LIBDIR = /usr/local/lib
 
 all: $(OFILES) lib
