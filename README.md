@@ -1,7 +1,7 @@
 # libSOIL for Mac OS X
 This is libSOIL (Simple OpenGL Image Library) with modifications to the Makefile to let it install nicely on Mac OS X. By default, libSOIL.a will be installed in /usr/local/lib and the libSOIL headers will be installed in /usr/local/include/SOIL.
 
-Forked from https://github.com/smibarber/libSOIL and incorporated changes from https://github.com/fenbf/SOIL\_ext (commit 739ec6499f7befce10d3b6c37519c6b7fed6efea), which includes:
+Forked from https://github.com/smibarber/libSOIL and incorporated changes from https://github.com/fenbf/SOIL_ext (commit 739ec6499f7befce10d3b6c37519c6b7fed6efea), which includes:
 
 * **[in progress]** Added option to use immutable texture storage
  * When possible (when extension is supported) library can create texture using glTextureStorage and then call glTexSubImage.
