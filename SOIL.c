@@ -24,6 +24,7 @@
 	/*	I can't test this Apple stuff!	*/
 	#include <OpenGL/gl.h>
 	#include <Carbon/Carbon.h>
+    #import <mach-o/dyld.h>
 	#define APIENTRY
 #else
 	#include <GL/gl.h>
@@ -32,6 +33,7 @@
 
 #include "SOIL.h"
 #include "stb_image_aug.h"
+#include "stb_image_write.h"
 #include "image_helper.h"
 #include "image_DXT.h"
 
@@ -47,8 +49,20 @@ enum{
 	SOIL_CAPABILITY_NONE = 0,
 	SOIL_CAPABILITY_PRESENT = 1
 };
+
+/* for glGetStringi */
+static int has_get_string_i_capability = SOIL_CAPABILITY_UNKNOWN;
+static int query_get_string_i_capability( void );
+
+#define SOIL_GL_NUM_EXTENSIONS                 0x821D
+typedef const GLubyte * (APIENTRY * P_SOIL_GETSTRINGIPROC) (GLenum name, GLuint index);
+P_SOIL_GETSTRINGIPROC soilGlGetStringi = NULL;
+
+static int soilIsExtensionSupported(const char *name);
+static void *soilLoadProcAddr(const char *procName);
+
 static int has_cubemap_capability = SOIL_CAPABILITY_UNKNOWN;
-int query_cubemap_capability( void );
+static int query_cubemap_capability( void );
 #define SOIL_TEXTURE_WRAP_R					0x8072
 #define SOIL_CLAMP_TO_EDGE					0x812F
 #define SOIL_NORMAL_MAP						0x8511
@@ -63,23 +77,33 @@ int query_cubemap_capability( void );
 #define SOIL_TEXTURE_CUBE_MAP_NEGATIVE_Z	0x851A
 #define SOIL_PROXY_TEXTURE_CUBE_MAP			0x851B
 #define SOIL_MAX_CUBE_MAP_TEXTURE_SIZE		0x851C
+
 /*	for non-power-of-two texture	*/
 static int has_NPOT_capability = SOIL_CAPABILITY_UNKNOWN;
-int query_NPOT_capability( void );
+static int query_NPOT_capability( void );
+
 /*	for texture rectangles	*/
 static int has_tex_rectangle_capability = SOIL_CAPABILITY_UNKNOWN;
-int query_tex_rectangle_capability( void );
+static int query_tex_rectangle_capability( void );
 #define SOIL_TEXTURE_RECTANGLE_ARB				0x84F5
 #define SOIL_MAX_RECTANGLE_TEXTURE_SIZE_ARB		0x84F8
+
 /*	for using DXT compression	*/
 static int has_DXT_capability = SOIL_CAPABILITY_UNKNOWN;
-int query_DXT_capability( void );
+static int query_DXT_capability( void );
 #define SOIL_RGB_S3TC_DXT1		0x83F0
 #define SOIL_RGBA_S3TC_DXT1		0x83F1
 #define SOIL_RGBA_S3TC_DXT3		0x83F2
 #define SOIL_RGBA_S3TC_DXT5		0x83F3
 typedef void (APIENTRY * P_SOIL_GLCOMPRESSEDTEXIMAGE2DPROC) (GLenum target, GLint level, GLenum internalformat, GLsizei width, GLsizei height, GLint border, GLsizei imageSize, const GLvoid * data);
 P_SOIL_GLCOMPRESSEDTEXIMAGE2DPROC soilGlCompressedTexImage2D = NULL;
+
+/* for glGenerateMipmap */
+static int has_gen_mipmap_capability = SOIL_CAPABILITY_UNKNOWN;
+typedef void (APIENTRY * P_SOIL_PFNGLGENERATEMIPMAPPROC) (GLenum target);
+static P_SOIL_PFNGLGENERATEMIPMAPPROC soilGlGenerateMipmap = NULL;
+static int query_gen_mipmap_capability( void );
+
 unsigned int SOIL_direct_load_DDS(
 		const char *filename,
 		unsigned int reuse_texture_ID,
@@ -91,6 +115,7 @@ unsigned int SOIL_direct_load_DDS_from_memory(
 		unsigned int reuse_texture_ID,
 		int flags,
 		int loading_as_cubemap );
+
 /*	other functions	*/
 unsigned int
 	SOIL_internal_create_OGL_texture
@@ -977,6 +1002,87 @@ void check_for_GL_errors( const char *calling_location )
 }
 #endif
 
+// bf: extracted function for mipmap generation
+static void createMipmaps(const unsigned char *const img,
+		int width, int height, int channels,
+		unsigned int flags,
+		unsigned int opengl_texture_type,
+		unsigned int opengl_texture_target,
+        unsigned int internal_texture_format, 
+        unsigned int original_texture_format,
+        int DXT_mode)
+{
+    if ((flags & SOIL_FLAG_GL_MIPMAPS) && query_gen_mipmap_capability() == SOIL_CAPABILITY_PRESENT)
+    {
+        soilGlGenerateMipmap(opengl_texture_target);
+    }
+    else
+    {
+        int MIPlevel = 1;
+        int MIPwidth = (width+1) / 2;
+        int MIPheight = (height+1) / 2;
+
+        unsigned char *resampled = (unsigned char*)malloc( channels*MIPwidth*MIPheight );
+
+	    while( ((1<<MIPlevel) <= width) || ((1<<MIPlevel) <= height) )
+	    {
+		    /*	do this MIPmap level	*/
+		    mipmap_image(
+				    img, width, height, channels,
+				    resampled,
+				    (1 << MIPlevel), (1 << MIPlevel) );
+		    /*  upload the MIPmaps	*/
+		    if( DXT_mode == SOIL_CAPABILITY_PRESENT )
+		    {
+			    /*	user wants me to do the DXT conversion!	*/
+			    int DDS_size;
+			    unsigned char *DDS_data = NULL;
+			    if( (channels & 1) == 1 )
+			    {
+				    /*	RGB, use DXT1	*/
+				    DDS_data = convert_image_to_DXT1(
+						    resampled, MIPwidth, MIPheight, channels, &DDS_size );
+			    } else
+			    {
+				    /*	RGBA, use DXT5	*/
+				    DDS_data = convert_image_to_DXT5(
+						    resampled, MIPwidth, MIPheight, channels, &DDS_size );
+			    }
+			    if( DDS_data )
+			    {
+				    soilGlCompressedTexImage2D(
+					    opengl_texture_target, MIPlevel,
+					    internal_texture_format, MIPwidth, MIPheight, 0,
+					    DDS_size, DDS_data );
+				    check_for_GL_errors( "glCompressedTexImage2D" );
+				    SOIL_free_image_data( DDS_data );
+			    } else
+			    {
+				    /*	my compression failed, try the OpenGL driver's version	*/
+				    glTexImage2D(
+					    opengl_texture_target, MIPlevel,
+					    internal_texture_format, MIPwidth, MIPheight, 0,
+					    original_texture_format, GL_UNSIGNED_BYTE, resampled );
+				    check_for_GL_errors( "glTexImage2D" );
+			    }
+		    } else
+		    {
+			    /*	user want OpenGL to do all the work!	*/
+			    glTexImage2D(
+				    opengl_texture_target, MIPlevel,
+				    internal_texture_format, MIPwidth, MIPheight, 0,
+				    original_texture_format, GL_UNSIGNED_BYTE, resampled );
+			    check_for_GL_errors( "glTexImage2D" );
+		    }
+		    /*	prep for the next level	*/
+		    ++MIPlevel;
+		    MIPwidth = (MIPwidth + 1) / 2;
+		    MIPheight = (MIPheight + 1) / 2;
+	    }
+	    SOIL_free_image_data( resampled );
+    }
+}
+
 unsigned int
 	SOIL_internal_create_OGL_texture
 	(
@@ -995,6 +1101,7 @@ unsigned int
 	unsigned int internal_texture_format = 0, original_texture_format = 0;
 	int DXT_mode = SOIL_CAPABILITY_UNKNOWN;
 	int max_supported_size;
+
 	/*	If the user wants to use the texture rectangle I kill a few flags	*/
 	if( flags & SOIL_FLAG_TEXTURE_RECTANGLE )
 	{
@@ -1256,68 +1363,10 @@ unsigned int
 			/*printf( "OpenGL DXT compressor\n" );	*/
 		}
 		/*	are any MIPmaps desired?	*/
-		if( flags & SOIL_FLAG_MIPMAPS )
+        if( flags & SOIL_FLAG_MIPMAPS || flags & SOIL_FLAG_GL_MIPMAPS)
 		{
-			int MIPlevel = 1;
-			int MIPwidth = (width+1) / 2;
-			int MIPheight = (height+1) / 2;
-			unsigned char *resampled = (unsigned char*)malloc( channels*MIPwidth*MIPheight );
-			while( ((1<<MIPlevel) <= width) || ((1<<MIPlevel) <= height) )
-			{
-				/*	do this MIPmap level	*/
-				mipmap_image(
-						img, width, height, channels,
-						resampled,
-						(1 << MIPlevel), (1 << MIPlevel) );
-				/*  upload the MIPmaps	*/
-				if( DXT_mode == SOIL_CAPABILITY_PRESENT )
-				{
-					/*	user wants me to do the DXT conversion!	*/
-					int DDS_size;
-					unsigned char *DDS_data = NULL;
-					if( (channels & 1) == 1 )
-					{
-						/*	RGB, use DXT1	*/
-						DDS_data = convert_image_to_DXT1(
-								resampled, MIPwidth, MIPheight, channels, &DDS_size );
-					} else
-					{
-						/*	RGBA, use DXT5	*/
-						DDS_data = convert_image_to_DXT5(
-								resampled, MIPwidth, MIPheight, channels, &DDS_size );
-					}
-					if( DDS_data )
-					{
-						soilGlCompressedTexImage2D(
-							opengl_texture_target, MIPlevel,
-							internal_texture_format, MIPwidth, MIPheight, 0,
-							DDS_size, DDS_data );
-						check_for_GL_errors( "glCompressedTexImage2D" );
-						SOIL_free_image_data( DDS_data );
-					} else
-					{
-						/*	my compression failed, try the OpenGL driver's version	*/
-						glTexImage2D(
-							opengl_texture_target, MIPlevel,
-							internal_texture_format, MIPwidth, MIPheight, 0,
-							original_texture_format, GL_UNSIGNED_BYTE, resampled );
-						check_for_GL_errors( "glTexImage2D" );
-					}
-				} else
-				{
-					/*	user want OpenGL to do all the work!	*/
-					glTexImage2D(
-						opengl_texture_target, MIPlevel,
-						internal_texture_format, MIPwidth, MIPheight, 0,
-						original_texture_format, GL_UNSIGNED_BYTE, resampled );
-					check_for_GL_errors( "glTexImage2D" );
-				}
-				/*	prep for the next level	*/
-				++MIPlevel;
-				MIPwidth = (MIPwidth + 1) / 2;
-				MIPheight = (MIPheight + 1) / 2;
-			}
-			SOIL_free_image_data( resampled );
+            createMipmaps(img, width, height, channels, flags, opengl_texture_type, opengl_texture_target, internal_texture_format, original_texture_format, DXT_mode);
+
 			/*	instruct OpenGL to use the MIPmaps	*/
 			glTexParameteri( opengl_texture_type, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
 			glTexParameteri( opengl_texture_type, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR );
@@ -1342,8 +1391,8 @@ unsigned int
 			check_for_GL_errors( "GL_TEXTURE_WRAP_*" );
 		} else
 		{
-			/*	unsigned int clamp_mode = SOIL_CLAMP_TO_EDGE;	*/
-			unsigned int clamp_mode = GL_CLAMP;
+			unsigned int clamp_mode = SOIL_CLAMP_TO_EDGE;
+			/*unsigned int clamp_mode = GL_CLAMP;*/
 			glTexParameteri( opengl_texture_type, GL_TEXTURE_WRAP_S, clamp_mode );
 			glTexParameteri( opengl_texture_type, GL_TEXTURE_WRAP_T, clamp_mode );
 			if( opengl_texture_type == SOIL_TEXTURE_CUBE_MAP )
@@ -1550,7 +1599,7 @@ unsigned int SOIL_direct_load_DDS_from_memory(
 	unsigned int flag;
 	unsigned int cf_target, ogl_target_start, ogl_target_end;
 	unsigned int opengl_texture_type;
-	int i;
+	unsigned int i;
 	/*	1st off, does the filename even exist?	*/
 	if( NULL == buffer )
 	{
@@ -1684,7 +1733,7 @@ unsigned int SOIL_direct_load_DDS_from_memory(
 			/*	compressed DDS, MIPmap size calculation is block based	*/
 			shift_offset = 2;
 		}
-		for( i = 1; i <= mipmaps; ++ i )
+		for( i = 1; i <= (unsigned int)mipmaps; ++ i )
 		{
 			int w, h;
 			w = width >> (shift_offset + i);
@@ -1716,7 +1765,7 @@ unsigned int SOIL_direct_load_DDS_from_memory(
 	/*	do this for each face of the cubemap!	*/
 	for( cf_target = ogl_target_start; cf_target <= ogl_target_end; ++cf_target )
 	{
-		if( buffer_index + DDS_full_size <= buffer_length )
+		if( buffer_index + DDS_full_size <= (unsigned int)buffer_length )
 		{
 			unsigned int byte_offset = DDS_main_size;
 			memcpy( (void*)DDS_data, (const void*)(&buffer[buffer_index]), DDS_full_size );
@@ -1744,7 +1793,7 @@ unsigned int SOIL_direct_load_DDS_from_memory(
 					DDS_main_size, DDS_data );
 			}
 			/*	upload the mipmaps, if we have them	*/
-			for( i = 1; i <= mipmaps; ++i )
+			for( i = 1; i <= (unsigned int)mipmaps; ++i )
 			{
 				int w, h, mip_size;
 				w = width >> i;
@@ -1809,8 +1858,8 @@ unsigned int SOIL_direct_load_DDS_from_memory(
 			glTexParameteri( opengl_texture_type, SOIL_TEXTURE_WRAP_R, GL_REPEAT );
 		} else
 		{
-			/*	unsigned int clamp_mode = SOIL_CLAMP_TO_EDGE;	*/
-			unsigned int clamp_mode = GL_CLAMP;
+			unsigned int clamp_mode = SOIL_CLAMP_TO_EDGE;
+			//unsigned int clamp_mode = GL_CLAMP;
 			glTexParameteri( opengl_texture_type, GL_TEXTURE_WRAP_S, clamp_mode );
 			glTexParameteri( opengl_texture_type, GL_TEXTURE_WRAP_T, clamp_mode );
 			glTexParameteri( opengl_texture_type, SOIL_TEXTURE_WRAP_R, clamp_mode );
@@ -1870,16 +1919,105 @@ unsigned int SOIL_direct_load_DDS(
 	return tex_ID;
 }
 
+int query_get_string_i_capability( void )
+{
+    if (has_get_string_i_capability == SOIL_CAPABILITY_UNKNOWN)
+    {
+        soilGlGetStringi = (P_SOIL_GETSTRINGIPROC)soilLoadProcAddr("glGetStringi");
+
+        if (soilGlGetStringi == NULL)
+            has_get_string_i_capability = SOIL_CAPABILITY_NONE;
+        else
+            has_get_string_i_capability = SOIL_CAPABILITY_PRESENT;
+    }
+
+	return has_get_string_i_capability;
+}
+
+int soilIsExtensionSupported(const char *name)
+{
+    if (query_get_string_i_capability() == SOIL_CAPABILITY_PRESENT)
+    {
+        int i;
+        int n = 0; 
+        glGetIntegerv(SOIL_GL_NUM_EXTENSIONS, &n); 
+        for (i = 0; i < n; i++) 
+        { 
+            const char* extension = (const char*)soilGlGetStringi(GL_EXTENSIONS, i);
+            if (!strcmp(name, extension)) 
+            {
+                return 1;
+            }
+        }
+        return 0;
+    } 
+
+    // use old functionality:
+    return NULL != strstr( (char const*)glGetString( GL_EXTENSIONS ), name);
+}
+
+#ifdef WIN32
+// from glload
+static int soilTestWinProcPointer(const PROC pTest)
+{
+    ptrdiff_t iTest;
+    if(!pTest) return 0;
+    iTest = (ptrdiff_t)pTest;
+
+    if(iTest == 1 || iTest == 2 || iTest == 3 || iTest == -1) return 0;
+
+    return 1;
+}
+#endif
+
+    void *soilLoadProcAddr(const char *procName)
+    {
+    #ifdef WIN32
+        PROC p = wglGetProcAddress(procName);
+        if (soilTestWinProcPointer(p))
+            return p;
+        else
+            return NULL;
+
+    #elif defined(__APPLE__) || defined(__APPLE_CC__)
+        /* modified for deprecated methods */        
+        CFURLRef bundleURL = CFURLCreateWithFileSystemPath(kCFAllocatorDefault,
+            CFSTR("/System/Library/Frameworks/OpenGL.framework"),
+            kCFURLPOSIXPathStyle,
+            true );
+        CFStringRef extensionName = CFStringCreateWithCString(kCFAllocatorDefault,
+            procName,
+            kCFStringEncodingASCII );
+
+        CFBundleRef bundle = CFBundleCreate( kCFAllocatorDefault, bundleURL );
+        assert( bundle != NULL );
+
+        void *ext_addr = CFBundleGetFunctionPointerForName(bundle, extensionName);
+
+        CFRelease( bundleURL );
+        CFRelease( extensionName );
+        CFRelease( bundle );
+
+        return ext_addr;
+    #elif defined ( linux ) || defined( __linux__ )
+        #if !defined(GLX_VERSION_1_4)
+            return glXGetProcAddressARB( (const GLubyte *)procName );
+        #else
+            return glXGetProcAddress( (const GLubyte *)procName );
+        #endif
+    #else
+        return NULL;    // unsupported
+    #endif  
+
+    }
+
 int query_NPOT_capability( void )
 {
 	/*	check for the capability	*/
 	if( has_NPOT_capability == SOIL_CAPABILITY_UNKNOWN )
 	{
 		/*	we haven't yet checked for the capability, do so	*/
-		if(
-			(NULL == strstr( (char const*)glGetString( GL_EXTENSIONS ),
-				"GL_ARB_texture_non_power_of_two" ) )
-			)
+		if(!soilIsExtensionSupported("GL_ARB_texture_non_power_of_two" ))
 		{
 			/*	not there, flag the failure	*/
 			has_NPOT_capability = SOIL_CAPABILITY_NONE;
@@ -1899,16 +2037,9 @@ int query_tex_rectangle_capability( void )
 	if( has_tex_rectangle_capability == SOIL_CAPABILITY_UNKNOWN )
 	{
 		/*	we haven't yet checked for the capability, do so	*/
-		if(
-			(NULL == strstr( (char const*)glGetString( GL_EXTENSIONS ),
-				"GL_ARB_texture_rectangle" ) )
-		&&
-			(NULL == strstr( (char const*)glGetString( GL_EXTENSIONS ),
-				"GL_EXT_texture_rectangle" ) )
-		&&
-			(NULL == strstr( (char const*)glGetString( GL_EXTENSIONS ),
-				"GL_NV_texture_rectangle" ) )
-			)
+		if(!soilIsExtensionSupported("GL_ARB_texture_rectangle" ) &&
+           !soilIsExtensionSupported("GL_EXT_texture_rectangle" ) &&
+           !soilIsExtensionSupported("GL_NV_texture_rectangle" ))
 		{
 			/*	not there, flag the failure	*/
 			has_tex_rectangle_capability = SOIL_CAPABILITY_NONE;
@@ -1928,13 +2059,8 @@ int query_cubemap_capability( void )
 	if( has_cubemap_capability == SOIL_CAPABILITY_UNKNOWN )
 	{
 		/*	we haven't yet checked for the capability, do so	*/
-		if(
-			(NULL == strstr( (char const*)glGetString( GL_EXTENSIONS ),
-				"GL_ARB_texture_cube_map" ) )
-		&&
-			(NULL == strstr( (char const*)glGetString( GL_EXTENSIONS ),
-				"GL_EXT_texture_cube_map" ) )
-			)
+		if(!soilIsExtensionSupported("GL_ARB_texture_cube_map") && 
+           !soilIsExtensionSupported("GL_EXT_texture_cube_map"))
 		{
 			/*	not there, flag the failure	*/
 			has_cubemap_capability = SOIL_CAPABILITY_NONE;
@@ -1954,53 +2080,15 @@ int query_DXT_capability( void )
 	if( has_DXT_capability == SOIL_CAPABILITY_UNKNOWN )
 	{
 		/*	we haven't yet checked for the capability, do so	*/
-		if( NULL == strstr(
-				(char const*)glGetString( GL_EXTENSIONS ),
-				"GL_EXT_texture_compression_s3tc" ) )
+		if(!soilIsExtensionSupported("GL_EXT_texture_compression_s3tc"))
 		{
 			/*	not there, flag the failure	*/
 			has_DXT_capability = SOIL_CAPABILITY_NONE;
 		} else
 		{
 			/*	and find the address of the extension function	*/
-			P_SOIL_GLCOMPRESSEDTEXIMAGE2DPROC ext_addr = NULL;
-			#ifdef WIN32
-				ext_addr = (P_SOIL_GLCOMPRESSEDTEXIMAGE2DPROC)
-						wglGetProcAddress
-						(
-							"glCompressedTexImage2DARB"
-						);
-			#elif defined(__APPLE__) || defined(__APPLE_CC__)
-				/*	I can't test this Apple stuff!	*/
-				CFBundleRef bundle;
-				CFURLRef bundleURL =
-					CFURLCreateWithFileSystemPath(
-						kCFAllocatorDefault,
-						CFSTR("/System/Library/Frameworks/OpenGL.framework"),
-						kCFURLPOSIXPathStyle,
-						true );
-				CFStringRef extensionName =
-					CFStringCreateWithCString(
-						kCFAllocatorDefault,
-						"glCompressedTexImage2DARB",
-						kCFStringEncodingASCII );
-				bundle = CFBundleCreate( kCFAllocatorDefault, bundleURL );
-				assert( bundle != NULL );
-				ext_addr = (P_SOIL_GLCOMPRESSEDTEXIMAGE2DPROC)
-						CFBundleGetFunctionPointerForName
-						(
-							bundle, extensionName
-						);
-				CFRelease( bundleURL );
-				CFRelease( extensionName );
-				CFRelease( bundle );
-			#else
-				ext_addr = (P_SOIL_GLCOMPRESSEDTEXIMAGE2DPROC)
-						glXGetProcAddressARB
-						(
-							(const GLubyte *)"glCompressedTexImage2DARB"
-						);
-			#endif
+            P_SOIL_GLCOMPRESSEDTEXIMAGE2DPROC ext_addr = (P_SOIL_GLCOMPRESSEDTEXIMAGE2DPROC)soilLoadProcAddr("glCompressedTexImage2DARB");
+			
 			/*	Flag it so no checks needed later	*/
 			if( NULL == ext_addr )
 			{
@@ -2021,4 +2109,33 @@ int query_DXT_capability( void )
 	}
 	/*	let the user know if we can do DXT or not	*/
 	return has_DXT_capability;
+}
+
+int query_gen_mipmap_capability( void )
+{
+	/*	check for the capability	*/
+	if( has_gen_mipmap_capability == SOIL_CAPABILITY_UNKNOWN )
+	{
+        // instead of checking "GL_ARB_framebuffer_object" or "GL_EXT_framebuffer_object"
+        // we simply test the function pointer
+        P_SOIL_PFNGLGENERATEMIPMAPPROC ext_addr = (P_SOIL_PFNGLGENERATEMIPMAPPROC)soilLoadProcAddr("glGenerateMipmap");
+
+		if(ext_addr == NULL)
+		{
+			ext_addr = (P_SOIL_PFNGLGENERATEMIPMAPPROC)soilLoadProcAddr("glGenerateMipmapEXT");
+        }
+
+        if(ext_addr == NULL)
+		{
+			/*	not there, flag the failure	*/
+			has_gen_mipmap_capability = SOIL_CAPABILITY_NONE;
+		} else
+		{
+			/*	it's there!	*/
+			has_gen_mipmap_capability = SOIL_CAPABILITY_PRESENT;
+            soilGlGenerateMipmap = ext_addr;
+		}
+	}
+	/*	let the user know if we can do glGenerateMipmap or not	*/
+	return has_gen_mipmap_capability;
 }
