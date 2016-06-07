@@ -19,6 +19,8 @@ Forked from https://github.com/smibarber/libSOIL and incorporated changes from h
 # Installing
 Clone this repo, make, make install. To install elsewhere, change the INCLUDEDIR and LIBDIR in the Makefile.
 
+To build under linux, use `make -f linux.make` instead of `make`
+
 # License
 Public domain.
 
